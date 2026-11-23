@@ -1,0 +1,255 @@
+name: Build POCO F3 GT (aresin) KSU-Next boot.img
+
+on:
+  workflow_dispatch:
+    inputs:
+      stock_boot_url:
+        description: "Direct download URL to stock boot.img (overrides STOCK_BOOT_URL in config/aresin.env)"
+        required: false
+        default: ""
+      kernel_repo:
+        description: "Override KERNEL_REPO URL (optional)"
+        required: false
+        default: ""
+      kernel_branch:
+        description: "Override KERNEL_BRANCH (optional)"
+        required: false
+        default: ""
+      defconfig:
+        description: "Override DEFCONFIG (optional)"
+        required: false
+        default: ""
+      ksu_hook_mode:
+        description: "KernelSU-Next hook mode (manual recommended for 4.14 MT6893)"
+        required: false
+        type: choice
+        options:
+          - manual
+          - kprobe
+        default: manual
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  build-boot-img:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout builder repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Load config/aresin.env and resolve overrides
+        id: cfg
+        run: |
+          set -a
+          source config/aresin.env
+          set +a
+
+          [ -n "${{ github.event.inputs.stock_boot_url }}" ] && STOCK_BOOT_URL="${{ github.event.inputs.stock_boot_url }}"
+          [ -n "${{ github.event.inputs.kernel_repo }}" ] && KERNEL_REPO="${{ github.event.inputs.kernel_repo }}"
+          [ -n "${{ github.event.inputs.kernel_branch }}" ] && KERNEL_BRANCH="${{ github.event.inputs.kernel_branch }}"
+          [ -n "${{ github.event.inputs.defconfig }}" ] && DEFCONFIG="${{ github.event.inputs.defconfig }}"
+          [ -n "${{ github.event.inputs.ksu_hook_mode }}" ] && KSU_HOOK_MODE="${{ github.event.inputs.ksu_hook_mode }}"
+
+          {
+            echo "DEVICE_CODENAME=$DEVICE_CODENAME"
+            echo "KERNEL_NAME=$KERNEL_NAME"
+            echo "ARCH=$ARCH"
+            echo "KBUILD_BUILD_USER=$KBUILD_BUILD_USER"
+            echo "KBUILD_BUILD_HOST=$KBUILD_BUILD_HOST"
+            echo "KERNEL_REPO=$KERNEL_REPO"
+            echo "KERNEL_BRANCH=$KERNEL_BRANCH"
+            echo "KERNEL_SUBMODULES=$KERNEL_SUBMODULES"
+            echo "DEFCONFIG=$DEFCONFIG"
+            echo "EXTRA_CONFIGS=$EXTRA_CONFIGS"
+            echo "STOCK_BOOT_URL=$STOCK_BOOT_URL"
+            echo "STOCK_BOOT_LOCAL=$STOCK_BOOT_LOCAL"
+            echo "KSU_NEXT_REPO=$KSU_NEXT_REPO"
+            echo "KSU_NEXT_BRANCH=$KSU_NEXT_BRANCH"
+            echo "KSU_HOOK_MODE=$KSU_HOOK_MODE"
+            echo "ENABLE_ALLOWLIST_WORKAROUND=$ENABLE_ALLOWLIST_WORKAROUND"
+            echo "INCLUDE_MANAGER_APK=$INCLUDE_MANAGER_APK"
+            echo "TOOLCHAIN=$TOOLCHAIN"
+            echo "CLANG_VERSION=$CLANG_VERSION"
+            echo "CUSTOM_CLANG_URL=$CUSTOM_CLANG_URL"
+            echo "LLVM_IAS=$LLVM_IAS"
+            echo "USE_GCC_COMPAT=$USE_GCC_COMPAT"
+            echo "GCC64_REPO=$GCC64_REPO"
+            echo "GCC64_BRANCH=$GCC64_BRANCH"
+            echo "GCC32_REPO=$GCC32_REPO"
+            echo "GCC32_BRANCH=$GCC32_BRANCH"
+            echo "MAGISKBOOT_VERSION=$MAGISKBOOT_VERSION"
+            echo "REPLACE_DTB=$REPLACE_DTB"
+          } >> "$GITHUB_ENV"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache cpio curl flex git kmod \
+            libelf-dev libssl-dev libncurses5-dev lz4 python3 python-is-python3 \
+            tar unzip wget xz-utils zip zstd jq
+
+      - name: Obtain stock boot.img
+        run: |
+          mkdir -p work/boot
+          if [ -n "$STOCK_BOOT_URL" ]; then
+            echo "Downloading stock boot.img from URL..."
+            curl -L --fail -o work/boot/stock_boot.img "$STOCK_BOOT_URL"
+          elif [ -f "$STOCK_BOOT_LOCAL" ]; then
+            echo "Using local $STOCK_BOOT_LOCAL..."
+            cp "$STOCK_BOOT_LOCAL" work/boot/stock_boot.img
+          else
+            echo "::error::No stock boot.img provided! Set stock_boot_url input, STOCK_BOOT_URL in config/aresin.env, or commit stock_boot/boot.img."
+            exit 1
+          fi
+          ls -lh work/boot/stock_boot.img
+
+      - name: Setup Toolchain (Clang + GCC 4.9 compat)
+        run: |
+          mkdir -p toolchain/clang
+          if [ "$TOOLCHAIN" = "zyc-clang" ]; then
+            API_BASE="https://api.github.com"
+            TAG=$(curl -s "${API_BASE}/repos/ZyCromerZ/Clang/releases" | jq -r "[.[] | select(.tag_name | startswith(\"${CLANG_VERSION}-\"))][0].tag_name")
+            URL=$(curl -s "${API_BASE}/repos/ZyCromerZ/Clang/releases/tags/${TAG}" | jq -r '.assets[] | select(.name | endswith(".tar.gz")) | .browser_download_url' | head -n 1)
+            echo "Downloading ZyC Clang: $URL"
+            curl -L --fail -o clang.tar.gz "$URL"
+            tar -xzf clang.tar.gz -C toolchain/clang
+            rm -f clang.tar.gz
+          elif [ "$TOOLCHAIN" = "custom-url" ] && [ -n "$CUSTOM_CLANG_URL" ]; then
+            curl -L --fail -o clang.tar.gz "$CUSTOM_CLANG_URL"
+            tar -xf clang.tar.gz -C toolchain/clang
+            rm -f clang.tar.gz
+          else
+            git clone --depth=1 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 -b main-kernel-build-2024 toolchain/aosp
+            LATEST_CLANG=$(ls -d toolchain/aosp/clang-r* | sort -V | tail -n 1)
+            mv "$LATEST_CLANG"/* toolchain/clang/
+          fi
+
+          if [ "$USE_GCC_COMPAT" = "true" ]; then
+            git clone --depth=1 -b "$GCC64_BRANCH" "$GCC64_REPO" toolchain/gcc64
+            git clone --depth=1 -b "$GCC32_BRANCH" "$GCC32_REPO" toolchain/gcc32
+          fi
+
+      - name: Clone Kernel Source & Apply Custom Patches
+        run: |
+          CLONE_ARGS="--depth=1"
+          [ -n "$KERNEL_BRANCH" ] && CLONE_ARGS="$CLONE_ARGS -b $KERNEL_BRANCH"
+          [ "$KERNEL_SUBMODULES" = "true" ] && CLONE_ARGS="$CLONE_ARGS --recurse-submodules"
+          git clone $CLONE_ARGS "$KERNEL_REPO" kernel
+
+          if [ -d "patches" ] && ls patches/*.patch >/dev/null 2>&1; then
+            cd kernel
+            for p in ../patches/*.patch; do
+              echo "Applying $p..."
+              git apply "$p"
+            done
+          fi
+
+      - name: Integrate KernelSU-Next (legacy branch + manual hooks)
+        run: |
+          cd kernel
+          curl -LSs "https://raw.githubusercontent.com/${KSU_NEXT_REPO}/${KSU_NEXT_BRANCH}/kernel/setup.sh" | bash -s "${KSU_NEXT_BRANCH}"
+
+          if [ "$KSU_HOOK_MODE" = "manual" ]; then
+            python3 ../scripts/apply_ksun_manual_hooks.py
+          fi
+
+      - name: Configure & Build Kernel
+        run: |
+          cd kernel
+          export PATH="$GITHUB_WORKSPACE/toolchain/clang/bin:$GITHUB_WORKSPACE/toolchain/gcc64/bin:$GITHUB_WORKSPACE/toolchain/gcc32/bin:$PATH"
+
+          if [ -f "arch/arm64/configs/${DEFCONFIG}" ]; then
+            SELECTED_DEFCONFIG="$DEFCONFIG"
+          elif [ -f "arch/arm64/configs/ares_defconfig" ]; then
+            SELECTED_DEFCONFIG="ares_defconfig"
+          else
+            echo "::error::Neither $DEFCONFIG nor ares_defconfig found in arch/arm64/configs/"
+            exit 1
+          fi
+
+          MAKE_ARGS=(
+            O=out
+            ARCH="$ARCH"
+            CC=clang
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-android-
+            CROSS_COMPILE_ARM32=arm-linux-androideabi-
+            LLVM_IAS="$LLVM_IAS"
+            KBUILD_BUILD_USER="$KBUILD_BUILD_USER"
+            KBUILD_BUILD_HOST="$KBUILD_BUILD_HOST"
+          )
+
+          make "${MAKE_ARGS[@]}" "$SELECTED_DEFCONFIG"
+
+          ./scripts/config --file out/.config \
+            -e CONFIG_KSU \
+            -d CONFIG_KSU_KPROBES_HOOK
+
+          if [ "$KSU_HOOK_MODE" = "manual" ]; then
+            ./scripts/config --file out/.config -e CONFIG_KSU_MANUAL_HOOK
+          else
+            ./scripts/config --file out/.config -e CONFIG_KSU_MANUAL_HOOK -d CONFIG_KSU_MANUAL_HOOK
+          fi
+
+          if [ "$ENABLE_ALLOWLIST_WORKAROUND" = "true" ]; then
+            ./scripts/config --file out/.config -e CONFIG_KSU_ALLOWLIST_WORKAROUND
+          fi
+
+          for cfg in $EXTRA_CONFIGS; do
+            ./scripts/config --file out/.config -e "$cfg"
+          done
+
+          make "${MAKE_ARGS[@]}" olddefconfig
+          make -j"$(nproc)" "${MAKE_ARGS[@]}"
+
+      - name: Download magiskboot (v30.7) & Repack stock boot.img
+        run: |
+          mkdir -p work/tools work/repack out_release
+          curl -L --fail -o work/tools/magisk.apk "https://github.com/topjohnwu/Magisk/releases/download/${MAGISKBOOT_VERSION}/Magisk-${MAGISKBOOT_VERSION}.apk"
+          unzip -p work/tools/magisk.apk "lib/x86_64/libmagiskboot.so" > work/tools/magiskboot
+          chmod +x work/tools/magiskboot
+
+          cp work/boot/stock_boot.img work/repack/boot.img
+          cd work/repack
+          ../tools/magiskboot unpack boot.img
+
+          if [ -f "$GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image.gz-dtb" ]; then
+            cp "$GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image.gz-dtb" kernel
+          elif [ -f "$GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image.gz" ]; then
+            cp "$GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image.gz" kernel
+          elif [ -f "$GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image" ]; then
+            cp "$GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image" kernel
+          else
+            echo "::error::Compiled kernel Image not found!"
+            exit 1
+          fi
+
+          if [ "$REPLACE_DTB" = "true" ] && [ -f "$GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/dtb.img" ]; then
+            cp "$GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/dtb.img" dtb
+          fi
+
+          ../tools/magiskboot repack boot.img
+          BUILD_DATE=$(date +%Y%m%d-%H%M)
+          OUT_IMG="boot-ksun-${DEVICE_CODENAME}-${BUILD_DATE}.img"
+          cp new-boot.img "$GITHUB_WORKSPACE/out_release/${OUT_IMG}"
+          echo "OUT_IMG=$OUT_IMG" >> "$GITHUB_ENV"
+
+      - name: Download Latest KernelSU-Next Manager APK
+        if: env.INCLUDE_MANAGER_APK == 'true'
+        run: |
+          API_BASE="https://api.github.com"
+          APK_URL=$(curl -s "${API_BASE}/repos/${KSU_NEXT_REPO}/releases/latest" | jq -r '.assets[] | select(.name | endswith(".apk")) | .browser_download_url' | head -n 1)
+          APK_NAME=$(basename "$APK_URL")
+          echo "Downloading latest KernelSU-Next Manager: $APK_NAME"
+          curl -L --fail -o "out_release/${APK_NAME}" "$APK_URL"
+
+      - name: Upload Patched boot.img & KernelSU-Next Manager APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.KERNEL_NAME }}-${{ env.DEVICE_CODENAME }}-package
+          path: out_release/*
